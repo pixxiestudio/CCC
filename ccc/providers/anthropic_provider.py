@@ -46,8 +46,15 @@ class AnthropicProvider(BaseProvider):
         self.forward_client_headers = forward_client_headers
         self._base = (deployment.api_base or _ANTHROPIC_API_BASE).rstrip("/")
 
+    def _rewrite_model(self, body: bytes) -> bytes:
+        """Replace the 'model' field with the real upstream model ID."""
+        payload = json.loads(body)
+        payload["model"] = self.deployment.model.removeprefix("anthropic/")
+        return json.dumps(payload).encode()
+
     async def complete(self, body: bytes, client_headers: dict[str, str]) -> httpx.Response:
         headers = self._build_headers(client_headers)
+        body = self._rewrite_model(body)
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -72,6 +79,7 @@ class AnthropicProvider(BaseProvider):
     ) -> AsyncGenerator[bytes, None]:
         """True streaming — keeps the httpx connection open and yields chunks."""
         headers = self._build_headers(client_headers)
+        body = self._rewrite_model(body)
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
