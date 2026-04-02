@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import AsyncGenerator
 
 import httpx
 
@@ -24,7 +25,17 @@ class BaseProvider(ABC):
     @abstractmethod
     async def complete(self, body: bytes, client_headers: dict[str, str]) -> httpx.Response:
         """
-        Send request; return raw httpx.Response on success.
+        Send request (non-streaming); return raw httpx.Response on success.
         Raise a CCCError subclass on failure.
+        """
+        ...
+
+    @abstractmethod
+    async def stream(
+        self, body: bytes, client_headers: dict[str, str]
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Send request and yield raw response bytes as they arrive (true streaming).
+        Raise a CCCError subclass on failure before yielding starts.
         """
         ...

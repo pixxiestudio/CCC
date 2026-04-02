@@ -94,6 +94,9 @@ async def messages(request: Request):
     model_group: str = payload.get("model", "")
     is_stream: bool = payload.get("stream", False)
 
+    if is_stream:
+        return await _handle_stream(request)
+
     try:
         upstream = await router.complete(model_group, body, _client_headers(request))
     except ModelNotFoundError as exc:
@@ -107,15 +110,6 @@ async def messages(request: Request):
         return JSONResponse(status_code=exc.http_status,
                             content=_error_body("api_error", str(exc)))
 
-    # Stream passthrough
-    if is_stream:
-        return StreamingResponse(
-            upstream.aiter_bytes(),
-            status_code=upstream.status_code,
-            media_type="text/event-stream",
-            headers=_safe_headers(upstream.headers),
-        )
-
     # Non-streaming
     return Response(
         content=upstream.content,
@@ -123,6 +117,53 @@ async def messages(request: Request):
         media_type="application/json",
         headers=_safe_headers(upstream.headers),
     )
+
+
+@app.post("/v1/messages/stream")
+async def messages_stream(request: Request):
+    """Dedicated streaming endpoint — keeps SSE connection alive end-to-end."""
+    return await _handle_stream(request)
+
+
+async def _handle_stream(request: Request):
+    if not _check_auth(request):
+        return JSONResponse(
+            status_code=401,
+            content={"type": "error", "error": {"type": "authentication_error",
+                                                  "message": "Invalid API key"}},
+        )
+
+    body = await request.body()
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return JSONResponse(status_code=400,
+                            content=_error_body("invalid_request_error", "Invalid JSON body"))
+
+    model_group: str = payload.get("model", "")
+    gen = router.stream(model_group, body, _client_headers(request))
+
+    # Peek at first chunk so we can return a proper error response if all providers fail
+    # (once we return StreamingResponse, error details can no longer be sent as JSON)
+    try:
+        first_chunk = await gen.__anext__()
+    except StopAsyncIteration:
+        return Response(content=b"", status_code=200, media_type="text/event-stream")
+    except ModelNotFoundError as exc:
+        return JSONResponse(status_code=404, content=_error_body("not_found_error", str(exc)))
+    except AllProvidersFailedError as exc:
+        logger.error("All providers failed (stream) for '%s': %s", model_group, exc)
+        return JSONResponse(status_code=503, content=_error_body("overloaded_error", str(exc)))
+    except CCCError as exc:
+        return JSONResponse(status_code=exc.http_status, content=_error_body("api_error", str(exc)))
+
+    async def _yield_all():
+        yield first_chunk
+        async for chunk in gen:
+            yield chunk
+
+    return StreamingResponse(_yield_all(), media_type="text/event-stream")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

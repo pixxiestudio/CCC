@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, AsyncGenerator
 
 import httpx
 
@@ -110,13 +110,9 @@ class FallbackRouter:
         """Attempt a single deployment with retries. Return response or None."""
         provider = self._providers[deployment.id]
         last_error: CCCError | None = None
-
-        # Determine retry count for the error type we expect (pre-first-attempt unknown)
-        # We retry up to max(applicable retries) — adjusting after each error type is seen
-        max_retries = self.config.num_retries
         attempt = 0
 
-        while attempt <= max_retries:
+        while True:
             try:
                 response = await provider.complete(body, client_headers)
                 self.health.record_success(deployment.id)
@@ -161,6 +157,93 @@ class FallbackRouter:
                 return names
         # Default: generic fallbacks
         return self.config.fallbacks.get(model_group, [])
+
+    async def stream(
+        self,
+        model_group: str,
+        body: bytes,
+        client_headers: dict[str, str],
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Streaming variant of complete(): yields raw bytes from the first
+        successful provider, applying the same group → fallback chain logic.
+        Raises AllProvidersFailedError if every provider fails before yielding.
+        """
+        if model_group not in self.config.model_groups:
+            raise ModelNotFoundError(f"Unknown model group: '{model_group}'")
+
+        errors: list[tuple[str, Exception]] = []
+
+        # Build ordered list of (group_name, deployment) to try
+        candidates = list(self.config.model_groups[model_group])
+        tried_primary = False
+
+        for deployment in candidates:
+            if not self.health.is_available(deployment.id):
+                logger.debug("Deployment %s is in cooldown — skipping", deployment.id)
+                continue
+
+            provider = self._providers[deployment.id]
+            gen = provider.stream(body, client_headers)
+
+            # Peek at first chunk: errors surface here before we're committed
+            try:
+                first_chunk = await gen.__anext__()
+            except StopAsyncIteration:
+                self.health.record_success(deployment.id)
+                return  # empty but successful response
+            except CCCError as exc:
+                logger.warning("Stream failure: deployment=%s error=%s", deployment.id, exc)
+                self.health.record_failure(deployment.id, exc)
+                errors.append((deployment.id, exc))
+                if not tried_primary:
+                    tried_primary = True
+                continue
+
+            # First chunk received — committed to this provider
+            self.health.record_success(deployment.id)
+            logger.info("Stream start: deployment=%s", deployment.id)
+            yield first_chunk
+            async for chunk in gen:
+                yield chunk
+            return
+
+            tried_primary = True  # noqa: unreachable — marks primary group done
+
+        # All primary deployments failed — try fallback groups
+        last_error = errors[-1][1] if errors else None
+        for fb_group in self._get_fallback_names(model_group, last_error):
+            if fb_group not in self.config.model_groups:
+                logger.warning("Fallback group '%s' not found — skipping", fb_group)
+                continue
+
+            for deployment in self.config.model_groups[fb_group]:
+                if not self.health.is_available(deployment.id):
+                    continue
+
+                provider = self._providers[deployment.id]
+                gen = provider.stream(body, client_headers)
+
+                try:
+                    first_chunk = await gen.__anext__()
+                except StopAsyncIteration:
+                    self.health.record_success(deployment.id)
+                    return
+                except CCCError as exc:
+                    logger.warning("Stream fallback failure: deployment=%s error=%s",
+                                   deployment.id, exc)
+                    self.health.record_failure(deployment.id, exc)
+                    errors.append((deployment.id, exc))
+                    continue
+
+                self.health.record_success(deployment.id)
+                logger.info("Stream fallback success: deployment=%s", deployment.id)
+                yield first_chunk
+                async for chunk in gen:
+                    yield chunk
+                return
+
+        raise AllProvidersFailedError(errors)
 
     def _build_providers(self) -> dict[str, BaseProvider]:
         """Instantiate one provider per deployment."""

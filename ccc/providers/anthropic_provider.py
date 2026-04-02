@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from typing import AsyncGenerator, NoReturn
 
 import httpx
 
@@ -64,6 +65,33 @@ class AnthropicProvider(BaseProvider):
             return response
 
         self._raise_for_status(response)
+        raise AssertionError("unreachable")  # keeps mypy happy
+
+    async def stream(
+        self, body: bytes, client_headers: dict[str, str]
+    ) -> AsyncGenerator[bytes, None]:
+        """True streaming — keeps the httpx connection open and yields chunks."""
+        headers = self._build_headers(client_headers)
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self._base}/v1/messages",
+                    content=body,
+                    headers=headers,
+                ) as response:
+                    if response.status_code != 200:
+                        content = await response.aread()
+                        self._raise_for_status(
+                            httpx.Response(response.status_code, content=content)
+                        )
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(str(exc)) from exc
+        except httpx.RequestError as exc:
+            raise InternalServerError(str(exc)) from exc
 
     def _build_headers(self, client_headers: dict[str, str]) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -88,16 +116,17 @@ class AnthropicProvider(BaseProvider):
         return headers
 
     @staticmethod
-    def _raise_for_status(response: httpx.Response) -> None:
+    def _raise_for_status(response: httpx.Response) -> NoReturn:
         body = response.content
         status = response.status_code
+        text = body[:200].decode(errors="replace")
 
         if status == 429:
-            raise RateLimitError(f"HTTP 429: {body[:200]}")
+            raise RateLimitError(f"HTTP 429: {text}")
         if status == 401:
-            raise AuthenticationError(f"HTTP 401: {body[:200]}")
+            raise AuthenticationError(f"HTTP 401: {text}")
         if status in (408, 504):
-            raise TimeoutError(f"HTTP {status}: {body[:200]}")
+            raise TimeoutError(f"HTTP {status}: {text}")
         if status == 400:
             raise _classify_400(body)
-        raise InternalServerError(f"HTTP {status}: {body[:200]}")
+        raise InternalServerError(f"HTTP {status}: {text}")

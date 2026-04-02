@@ -237,3 +237,87 @@ async def test_rate_limit_zero_retries():
 
     assert resp.status_code == 200
     assert call_count_dep1 == 1  # tried only once (0 retries)
+
+
+@pytest.mark.asyncio
+async def test_retry_policy_takes_precedence_over_global_num_retries():
+    """
+    Per-error policy retries should override the global num_retries cap.
+    Config: num_retries=2, InternalServerErrorRetries=3 → expect 4 total attempts.
+    """
+    dep = _make_deployment("it-opus", 1)
+    cfg = Config(
+        model_groups={"it-opus": [dep]},
+        fallbacks={},
+        context_window_fallbacks={},
+        retry_policy={"InternalServerError": 3},   # 3 retries = 4 total attempts
+        allowed_fails_policy={},
+        num_retries=2,         # global cap — must NOT override the per-error policy
+        cooldown_time=5,
+    )
+    r = FallbackRouter(cfg)
+
+    call_count = 0
+
+    async def flaky(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 4:
+            raise InternalServerError("500")
+        return _ok_response()
+
+    with patch.object(r._providers[dep.id], "complete", new=AsyncMock(side_effect=flaky)):
+        resp = await r.complete("it-opus", REQUEST_BODY, CLIENT_HEADERS)
+
+    assert resp.status_code == 200
+    assert call_count == 4  # 3 retries + 1 success = 4 attempts
+
+
+@pytest.mark.asyncio
+async def test_stream_success_yields_bytes():
+    """router.stream() should yield bytes from the provider."""
+    dep = _make_deployment("it-opus", 1)
+    cfg = _make_config({"it-opus": [dep]})
+    r = FallbackRouter(cfg)
+
+    chunks = [b"data: chunk1\n\n", b"data: chunk2\n\n"]
+
+    async def _fake_stream(*args, **kwargs):
+        for chunk in chunks:
+            yield chunk
+
+    with patch.object(r._providers[dep.id], "stream", side_effect=_fake_stream):
+        received = []
+        async for chunk in r.stream("it-opus", REQUEST_BODY, CLIENT_HEADERS):
+            received.append(chunk)
+
+    assert received == chunks
+
+
+@pytest.mark.asyncio
+async def test_stream_falls_back_on_error():
+    """router.stream() falls back to next deployment when first fails before yielding."""
+    dep1 = _make_deployment("it-opus", 1)
+    dep2 = _make_deployment("it-opus", 2, api_key="tok-b")
+    cfg = _make_config({"it-opus": [dep1, dep2]})
+    r = FallbackRouter(cfg)
+
+    fallback_chunks = [b"data: fallback\n\n"]
+
+    async def _failing_stream(*args, **kwargs):
+        raise RateLimitError("429")
+        yield  # make it an async generator
+
+    async def _ok_stream(*args, **kwargs):
+        for chunk in fallback_chunks:
+            yield chunk
+
+    with (
+        patch.object(r._providers[dep1.id], "stream", side_effect=_failing_stream),
+        patch.object(r._providers[dep2.id], "stream", side_effect=_ok_stream),
+    ):
+        received = []
+        async for chunk in r.stream("it-opus", REQUEST_BODY, CLIENT_HEADERS):
+            received.append(chunk)
+
+    assert received == fallback_chunks

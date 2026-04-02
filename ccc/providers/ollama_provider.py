@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from typing import AsyncGenerator
 
 import httpx
 
@@ -77,6 +78,13 @@ class OllamaProvider(BaseProvider):
         if req.get("temperature") is not None:
             body["temperature"] = req["temperature"]
         return body
+
+    async def stream(
+        self, body: bytes, client_headers: dict[str, str]
+    ) -> AsyncGenerator[bytes, None]:
+        """Ollama is non-streaming; yield the full buffered response as one chunk."""
+        response = await self.complete(body, client_headers)
+        yield response.content
 
     @staticmethod
     def _to_anthropic(oai: dict, original_req: dict) -> dict:
