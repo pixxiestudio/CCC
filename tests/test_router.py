@@ -321,3 +321,77 @@ async def test_stream_falls_back_on_error():
             received.append(chunk)
 
     assert received == fallback_chunks
+
+
+@pytest.mark.asyncio
+async def test_sub_a_rate_limited_sub_b_handles():
+    """
+    Real-world scenario verification:
+    Sub A (order 1) hits a rate limit → Sub B (order 2) serves the request.
+
+    With RateLimitErrorRetries: 0 Sub A is tried exactly once (no retry),
+    then the router moves immediately to Sub B.
+    """
+    sub_a = _make_deployment("dev-sonnet", 1, api_key="sub-a-key")
+    sub_b = _make_deployment("dev-sonnet", 2, api_key="sub-b-key")
+    cfg = _make_config(
+        {"dev-sonnet": [sub_a, sub_b]},
+        retry_policy={"RateLimitError": 0},
+    )
+    r = FallbackRouter(cfg)
+
+    sub_a_calls = 0
+
+    async def sub_a_rate_limited(*args, **kwargs):
+        nonlocal sub_a_calls
+        sub_a_calls += 1
+        raise RateLimitError("429 — quota exceeded")
+
+    with (
+        patch.object(r._providers[sub_a.id], "complete",
+                     new=AsyncMock(side_effect=sub_a_rate_limited)),
+        patch.object(r._providers[sub_b.id], "complete",
+                     new=AsyncMock(return_value=_ok_response("from_sub_b"))),
+    ):
+        resp = await r.complete("dev-sonnet", REQUEST_BODY, CLIENT_HEADERS)
+
+    assert resp.status_code == 200
+    assert sub_a_calls == 1  # Sub A tried exactly once, immediately skipped
+    assert json.loads(resp.content)["content"][0]["text"] == "from_sub_b"
+
+
+@pytest.mark.asyncio
+async def test_sub_a_inactive_sub_b_handles():
+    """
+    Real-world scenario verification:
+    Sub A is in cooldown (simulated as unavailable) — router skips it entirely
+    and goes straight to Sub B.
+    """
+    sub_a = _make_deployment("dev-sonnet", 1, api_key="sub-a-key")
+    sub_b = _make_deployment("dev-sonnet", 2, api_key="sub-b-key")
+    cfg = _make_config({"dev-sonnet": [sub_a, sub_b]})
+    r = FallbackRouter(cfg)
+
+    # Put Sub A into cooldown manually
+    r.health.record_failure(sub_a.id, RateLimitError("429"))
+    r.health.record_failure(sub_a.id, RateLimitError("429"))
+    r.health.record_failure(sub_a.id, RateLimitError("429"))  # hits default threshold of 3
+
+    sub_a_calls = 0
+
+    async def sub_a_should_not_be_called(*args, **kwargs):
+        nonlocal sub_a_calls
+        sub_a_calls += 1
+        return _ok_response("should_not_reach_here")
+
+    with (
+        patch.object(r._providers[sub_a.id], "complete",
+                     new=AsyncMock(side_effect=sub_a_should_not_be_called)),
+        patch.object(r._providers[sub_b.id], "complete",
+                     new=AsyncMock(return_value=_ok_response("from_sub_b"))),
+    ):
+        resp = await r.complete("dev-sonnet", REQUEST_BODY, CLIENT_HEADERS)
+
+    assert resp.status_code == 200
+    assert sub_a_calls == 0  # Sub A was skipped — it was in cooldown
+    assert json.loads(resp.content)["content"][0]["text"] == "from_sub_b"
