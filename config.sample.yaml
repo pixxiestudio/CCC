@@ -1,0 +1,102 @@
+model_list:
+
+  # ── IT TEAM ────────────────────────────────────────────────────────────────
+  # Claude Code clients set: model=it-opus
+
+  # Primary: Sub A OAuth token, Opus
+  - model_name: it-opus
+    litellm_params:
+      model: anthropic/claude-opus-4-6
+      api_base: https://api.anthropic.com
+      api_key: os.environ/SUB_A_OAUTH_TOKEN
+    model_info:
+      order: 1
+
+  # Failover: Sub B OAuth token, Opus
+  - model_name: it-opus
+    litellm_params:
+      model: anthropic/claude-opus-4-6
+      api_base: https://api.anthropic.com
+      api_key: os.environ/SUB_B_OAUTH_TOKEN
+    model_info:
+      order: 2
+
+  # ── DEV TEAM ───────────────────────────────────────────────────────────────
+  # Claude Code clients set: model=dev-sonnet
+
+  # Primary: Sub A OAuth token, Sonnet
+  - model_name: dev-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_base: https://api.anthropic.com
+      api_key: os.environ/SUB_A_OAUTH_TOKEN
+    model_info:
+      order: 1
+
+  # Failover: Sub B OAuth token, Sonnet
+  - model_name: dev-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_base: https://api.anthropic.com
+      api_key: os.environ/SUB_B_OAUTH_TOKEN
+    model_info:
+      order: 2
+
+  # ── FALLBACK MODELS ────────────────────────────────────────────────────────
+
+  # Paid API key — emergency fallback (Sonnet, cheaper than Opus)
+  - model_name: api-fallback
+    litellm_params:
+      model: anthropic/claude-sonnet-4-6
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # Local Ollama — always available, zero cost, true last resort
+  - model_name: local-fallback
+    litellm_params:
+      model: ollama/llama3.2
+      api_base: http://host.docker.internal:11434
+
+# ── ROUTER SETTINGS ──────────────────────────────────────────────────────────
+router_settings:
+  num_retries: 2
+  timeout: 60
+  cooldown_time: 60         # seconds to skip a deployment after it hits its fail threshold
+
+  # After all deployments in a group fail, try these groups in order
+  fallbacks:
+    - it-opus:    ["api-fallback", "local-fallback"]
+    - dev-sonnet: ["api-fallback", "local-fallback"]
+
+  # Only triggered when the error is a context-window exceeded error
+  context_window_fallbacks:
+    - it-opus:    ["api-fallback"]
+    - dev-sonnet: ["api-fallback"]
+
+  # Optional: Redis for shared health state across multiple proxy instances
+  # redis_host: os.environ/REDIS_HOST
+  # redis_port: 6379
+  # redis_password: os.environ/REDIS_PASSWORD
+
+# ── RETRY POLICY PER ERROR TYPE ──────────────────────────────────────────────
+litellm_settings:
+  num_retries: 2
+  request_timeout: 60
+
+  retry_policy:
+    RateLimitErrorRetries: 0        # rate-limited → switch immediately, no retry
+    AuthenticationErrorRetries: 0   # bad key → switch immediately, no retry
+    TimeoutErrorRetries: 2          # timeout → retry twice before switching
+    InternalServerErrorRetries: 3   # server error → retry three times
+
+  allowed_fails_policy:
+    RateLimitErrorAllowedFails: 1   # 1 rate limit hit → cooldown that deployment
+    TimeoutErrorAllowedFails: 3
+    InternalServerErrorAllowedFails: 5
+
+  forward_client_headers_to_llm_api: true   # pass client's auth header to upstream
+
+# ── PROXY AUTH ────────────────────────────────────────────────────────────────
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # clients must send this key
+  # disable_key_check: true                   # uncomment to skip auth (dev only)
+  forward_llm_provider_auth_headers: true
